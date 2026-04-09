@@ -1,0 +1,18 @@
+[Unit]
+Description=ReedoC KakaoTalk Bot Daemon
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=reedo
+WorkingDirectory=/home/reedo
+ExecStart=/usr/bin/python3 -u /home/reedo/reedo-kakao-bot/reedo-daemon-vps.py
+StandardOutput=append:/home/reedo/reedo-daemon.log
+StandardError=append:/home/reedo/reedo-daemon.log
+Restart=on-failure
+RestartSec=10
+Environment=HOME=/home/reedo
+Environment=PATH=/home/reedo/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

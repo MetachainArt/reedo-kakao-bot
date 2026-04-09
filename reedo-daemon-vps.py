@@ -33,6 +33,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(SCRIPT_DIR, "config.json")
 KAKAODECRYPT_DIR = os.path.expanduser("~/kakaodecrypt")
 KAKAO_DB_WORK = "/tmp/reedo_kakao.db"
+KAKAO_DB2_WORK = "/tmp/reedo_kakao2.db"
 STATE_FILE = os.path.expanduser("~/.reedo-daemon-state.json")
 ADB_TARGET = "localhost:5555"
 
@@ -107,7 +108,6 @@ def copy_and_decrypt_db(user_id):
             )
 
         # CRITICAL: Checkpoint WAL before decryption!
-        # Without this, recent messages in WAL won't be visible.
         subprocess.run(
             ["sqlite3", KAKAO_DB_WORK, "PRAGMA wal_checkpoint(TRUNCATE);"],
             capture_output=True, timeout=5
@@ -119,6 +119,29 @@ def copy_and_decrypt_db(user_id):
              "-u", user_id, KAKAO_DB_WORK],
             capture_output=True, text=True, timeout=15
         )
+
+        # Copy and decrypt KakaoTalk2.db (friends/contacts)
+        for ext in ["", "-wal", "-shm"]:
+            src = f"{REDROID_CONTAINER}:/data/data/com.kakao.talk/databases/KakaoTalk2.db{ext}"
+            dst = KAKAO_DB2_WORK + ext
+            subprocess.run(
+                ["sudo", "docker", "cp", src, dst],
+                capture_output=True, timeout=10
+            )
+            subprocess.run(
+                ["sudo", "chmod", "666", dst],
+                capture_output=True, timeout=5
+            )
+        subprocess.run(
+            ["sqlite3", KAKAO_DB2_WORK, "PRAGMA wal_checkpoint(TRUNCATE);"],
+            capture_output=True, timeout=5
+        )
+        subprocess.run(
+            ["python3", os.path.join(KAKAODECRYPT_DIR, "kakaodecrypt.py"),
+             "-u", user_id, KAKAO_DB2_WORK],
+            capture_output=True, text=True, timeout=15
+        )
+
         return True
     except Exception as e:
         print(f"[ERROR] DB copy/decrypt failed: {e}")
@@ -149,31 +172,59 @@ def read_new_messages(last_id, my_user_id):
 
 
 def get_user_name(user_id):
-    """Get display name for a user_id from friends table."""
+    """Get display name for a user_id from friends_dec table (KakaoTalk2.db)."""
     try:
-        conn = sqlite3.connect(KAKAO_DB_WORK)
+        conn = sqlite3.connect(KAKAO_DB2_WORK)
         cur = conn.cursor()
-        cur.execute("SELECT name FROM friends WHERE id = ?", (user_id,))
+        cur.execute("SELECT name FROM friends_dec WHERE id = ?", (user_id,))
         row = cur.fetchone()
         conn.close()
-        return row[0] if row else str(user_id)
+        if row and row[0]:
+            return row[0]
     except:
-        return str(user_id)
+        pass
+    return str(user_id)
 
 
 def get_chat_name(chat_id):
-    """Get chat room name. For DirectChat, returns the friend's name."""
+    """Get chat room name.
+
+    - DirectChat: returns the friend's name from friends_dec
+    - Open/Group chat: looks up name in open_link table (KakaoTalk2.db)
+    """
     try:
         conn = sqlite3.connect(KAKAO_DB_WORK)
         cur = conn.cursor()
-        cur.execute("SELECT type, members FROM chat_rooms_dec WHERE id = ?", (chat_id,))
+        cur.execute("SELECT type, members, link_id FROM chat_rooms_dec WHERE id = ?", (chat_id,))
         row = cur.fetchone()
-        if row and row[0] == "DirectChat" and row[1]:
-            member_ids = json.loads(row[1])
-            if member_ids:
-                conn.close()
-                return get_user_name(member_ids[0])
+        if not row:
+            conn.close()
+            return str(chat_id)
+
+        room_type, members, link_id = row
         conn.close()
+
+        # DirectChat: use friend name
+        if room_type == "DirectChat" and members:
+            member_ids = json.loads(members)
+            if member_ids:
+                name = get_user_name(member_ids[0])
+                if not name.isdigit():
+                    return name
+
+        # Open/Group chat: look up name in open_link table (KakaoTalk2.db)
+        if link_id:
+            try:
+                conn2 = sqlite3.connect(KAKAO_DB2_WORK)
+                cur2 = conn2.cursor()
+                cur2.execute("SELECT name FROM open_link WHERE id = ?", (link_id,))
+                r = cur2.fetchone()
+                conn2.close()
+                if r and r[0]:
+                    return r[0]
+            except:
+                pass
+
         return str(chat_id)
     except:
         return str(chat_id)
@@ -203,29 +254,21 @@ def get_recent_context(chat_id, my_user_id, bot_name, limit=10):
 def get_ai_reply(config, chat_name, sender, message, chat_id, my_user_id):
     """Get AI reply from OpenClaw agent.
 
-    PITFALL: OpenClaw path must be absolute on VPS.
-    Use OPENCLAW_BIN env var or adjust the default path.
+    Uses a minimal prompt — bot personality is defined in SOUL.md of the
+    OpenClaw workspace, so the daemon prompt only provides conversation context.
     """
     try:
         bot_name = config["bot_name"]
-        style = config["style"]
         agent_id = config.get("openclaw_agent_id", "kakao")
-        context = get_recent_context(chat_id, my_user_id, bot_name, 10)
-        context_part = f"\n\n최근 대화:\n{context}\n\n" if context else ""
+        context = get_recent_context(chat_id, my_user_id, bot_name, 5)
+        context_part = f"\n최근대화:\n{context}\n" if context else ""
 
-        prompt = f"""카카오톡 '{chat_name}' 채팅방.{context_part}{sender}의 마지막 메시지: \"{message}\"
-
-너는 {bot_name}(똑똑한 AI 비서). 규칙:
-- {style}
-- 질문에 정확하고 구체적으로 답해. 요청한 만큼 길게 써.
-- 분석, 목록, 계획 등을 요청하면 상세하게 작성해.
-- 간단한 인사나 잡담에만 짧게 답해.
-- 답장 텍스트만 출력."""
+        prompt = f"""[{chat_name}] {sender}: "{message}"{context_part}
+답장만 출력."""
 
         # Use absolute path for OpenClaw on VPS
         openclaw_bin = OPENCLAW_BIN
         if not os.path.exists(openclaw_bin):
-            # Fallback: try PATH
             openclaw_bin = "openclaw"
 
         result = subprocess.run(
@@ -256,12 +299,6 @@ def send_message(message):
              - Adjust if using different resolution.
     """
     try:
-        # Tap input area (adjust coordinates for your resolution)
-        # 720x1280 resolution: center-bottom input field
-        subprocess.run(
-            ["adb", "-s", ADB_TARGET, "shell", "input", "tap", "360", "1150"],
-            capture_output=True, timeout=10
-        )
         time.sleep(0.5)
 
         # Split long messages (ADB Keyboard has ~300 char limit)
