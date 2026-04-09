@@ -1,0 +1,12 @@
+{
+  "bot_name": "뽀리",
+  "style": "존댓말로 친근하고 귀엽게. 이모티콘 적당히.",
+  "model": "openai-codex/gpt-5.4",
+  "interval": 5,
+  "reply_all_dm": true,
+  "group_trigger": "뽀리",
+  "max_reply_length": 1000,
+  "openclaw_agent_id": "kakao",
+  "quiet_hours_start": 23,
+  "quiet_hours_end": 8
+}
